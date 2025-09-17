@@ -1,0 +1,12 @@
+BCBM_classifier_env
+.vscode
+.__pycache__
+data/
+data_processed/
+logs/
+models/
+plots/
+*.pyc
+.DS_Store
+*__pycache__*
+notebooks/*
