@@ -1,6 +1,6 @@
 import torch
 import torch.nn.functional as F
-from constants import DEVICE, DTYPE
+from utils.constants import DEVICE, DTYPE
 
 class DiceLoss(torch.nn.Module):
     def __init__(self, smooth=1e-6):
@@ -29,27 +29,38 @@ class MixedLoss(torch.nn.Module):
 
         self.mix_coeff = mix_coeff
 
-        self.bce = torch.nn.BCEWithLogitsLoss(pos_weight=self.pos_weight)
+        self.bce = torch.nn.BCEWithLogitsLoss(pos_weight=self.pos_weight, reduction='none') # manual reduction for nan filtering
         self.dice = DiceLoss()
 
     def forward(self, clf_logits, seg_logits, labels, mask, only_clf=False):
 
+        # clf_logits: [B, 3]
+        # labels: [B, 3] with possible NaNs
+
+        # seg_logits: [B, 1, D, H, W]
+        # mask: [B, 1, D, H, W]
 
         # Classification loss (BCE) with handling of possible asymmetric NaN labels
-        num_classes = labels.shape[1]
+        # num_classes = labels.shape[1]
 
         clf_loss = 0.0
-        valid_classes = 0
-        for i in range(num_classes):
-            nanmask = ~torch.isnan(labels[:, i])  # [batch], True where label is valid
-            if nanmask.sum() > 0:
-                class_logits = clf_logits[nanmask, i]
-                class_labels = labels[nanmask, i].float()
-                clf_loss += self.bce(class_logits, class_labels)
-                valid_classes += 1
+        # valid_classes = 0
 
-        if valid_classes > 0:
-            clf_loss = clf_loss / valid_classes
+        valid_mask = ~torch.isnan(labels)     # [B, 3], True where label is valid
+
+        # replacing nans with 0 so BCE can run (temporary, won't be counted in loss)
+        labels_clamped = torch.where(valid_mask, labels, torch.zeros_like(labels))
+
+        bce_raw = self.bce(clf_logits, labels_clamped.to(dtype=DTYPE))  # compute BCE for all, including nans
+
+        bce_masked = bce_raw * valid_mask.to(dtype=DTYPE)  # zero out losses where label is nan
+
+        # Average only over valid entries (across batch and classes)
+        num_valid = valid_mask.sum().item()
+        clf_loss = bce_masked.sum() / num_valid
+
+        if num_valid > 0:
+            clf_loss = clf_loss / num_valid
         else:
             clf_loss = torch.tensor(0.0, device=DEVICE, dtype=DTYPE)
 

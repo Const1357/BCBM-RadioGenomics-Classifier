@@ -71,6 +71,7 @@ class UNetEncoder(torch.nn.Module):
     def forward(self, x):
         skips = []
         for i in range(self.depth):
+            print('encoder block', i)
             x = self.enc_blocks[i](x)
             skips.append(x) # store result for skip connection
 
@@ -120,6 +121,7 @@ class UNetDecoder(nn.Module):
     def forward(self, x, skips):
 
         for i in range(self.depth - 1):
+            print('decoder block', i)
             # 1. Upsample
             x = self.upconv_layers[i](x)
 
@@ -169,10 +171,13 @@ class UNet3D(nn.Module):
 
     def forward(self, x):
 
+        print('Unet Encoding')
         bottleneck, skips = self.encoder(x)
+        print('Unet Classifying')
         classifier_out = self.classifier(bottleneck)
 
         if self.training:
+            print('Unet Decoding (Training Only)')
             segmentation_out = self.decoder(bottleneck, skips)
             return classifier_out, segmentation_out
         else:

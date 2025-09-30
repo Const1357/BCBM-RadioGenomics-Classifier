@@ -49,17 +49,22 @@ class Trainer:
         epoch_seg_loss = 0.0
 
         for img, mask, labels in train_loader:
-            img = img.to(DEVICE)
+            print('batch')
+            img = img.to(DEVICE, DTYPE)
             mask = mask.to(DEVICE)
             labels = labels.to(DEVICE)
+            print('batch loaded')
 
             self.optimizer.zero_grad()
 
-            clf_logits, seg_logits = self.model(img)
+            clf_logits, seg_logits = self.model(img)    # [B, 3], [B, 1, D, H, W]
+            print(clf_logits.shape, seg_logits.shape)
+            print('forward pass done')
 
             loss, clf_loss, seg_loss = self.criterion(clf_logits, seg_logits, labels, mask)
             loss.backward()
             self.optimizer.step()
+            print('backward pass done')
 
             epoch_loss += loss.item()
             epoch_clf_loss += clf_loss.item()
