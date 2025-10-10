@@ -274,7 +274,7 @@ class MRIAugmentationPipeline(nn.Module):
         RandomTranslation3D(max_shift=(5, 10, 10), p=0.8),
         ElasticDeformation3D(alpha=2.0, sigma=8.0, p=0.2),
         RandomRotation3D(max_angle=8.0, p=0.3),
-        RandomGamma3D(gamma_range=(0.8, 1.2), p=0.7),
+        RandomGamma3D(gamma_range=(0.8, 1.2), p=1.0),
         RandomGaussianBlur3D(sigma_range=(0, 0.5), p=0.3)
     ]):
         super().__init__()

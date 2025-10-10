@@ -1,7 +1,7 @@
 import torch
 
-TARGET_SHAPE = (128, 128, 64)
-DTYPE = torch.float16
+TARGET_SHAPE = (256, 256, 128)  # (W, H, D) after padding and resizing/cropping
+DTYPE = torch.float32
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 TRAIN_IMG_DIR = 'data_processed/train_data/images_masks' 
@@ -11,3 +11,8 @@ TEST_IMG_DIR = 'data_processed/test_data/images_masks'
 TRAIN_LABEL_FILE = 'data_processed/train_data/clinical_labels.csv' 
 VAL_LABEL_FILE = 'data_processed/val_data/clinical_labels.csv' 
 TEST_LABEL_FILE = 'data_processed/test_data/clinical_labels.csv' 
+
+# EXPERIMENT_DIR = 'experiments/UNet3D'
+EXPERIMENT_DIR = 'experiments'
+
+print(DEVICE, DTYPE)

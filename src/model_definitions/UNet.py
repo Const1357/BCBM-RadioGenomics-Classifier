@@ -3,6 +3,8 @@ import torch.nn.functional as F
 from torch import nn
 import os
 
+from utils.constants import DEVICE
+
 # Why U-Net?
 # U-Net is popular for segmentation tasks due to its encoder-decoder structure with skip connections.
 # The encoder produces hierarchical features, while the decoder reconstructs the segmentation map.
@@ -16,7 +18,7 @@ import os
 # GAP (Global Average Pooling) is used in the classifier head to reduce overfitting and model size.
 
 class ConvBlock3D(nn.Module):
-    # halves the spatial dimensions
+
     def __init__(self, in_channels, out_channels, dropout=0.0):
         super(ConvBlock3D, self).__init__()
         self.block = nn.Sequential(
@@ -40,7 +42,7 @@ class ConvBlock3D(nn.Module):
 
 class UNetEncoder(torch.nn.Module):
 
-    def __init__(self, depth=3, base_filters=16):
+    def __init__(self, depth=3, base_filters=16, dropout=0.0):
         super(UNetEncoder, self).__init__()
 
         self.depth = depth
@@ -56,7 +58,7 @@ class UNetEncoder(torch.nn.Module):
         for i in range(depth):
             
             # each block HALVES the spatial dimensions and DOUBLES the number of channels
-            enc = ConvBlock3D(last_in_channels, last_out_channels)
+            enc = ConvBlock3D(last_in_channels, last_out_channels, dropout=dropout)
             self.enc_blocks.append(enc)
 
             if i < depth - 1:   # no maxpool after the last block
@@ -71,7 +73,7 @@ class UNetEncoder(torch.nn.Module):
     def forward(self, x):
         skips = []
         for i in range(self.depth):
-            print('encoder block', i)
+            # print('encoder block', i)
             x = self.enc_blocks[i](x)
             skips.append(x) # store result for skip connection
 
@@ -121,7 +123,7 @@ class UNetDecoder(nn.Module):
     def forward(self, x, skips):
 
         for i in range(self.depth - 1):
-            print('decoder block', i)
+            # print('decoder block', i)
             # 1. Upsample
             x = self.upconv_layers[i](x)
 
@@ -139,15 +141,17 @@ class UNetDecoder(nn.Module):
         return x
     
 class ClassifierHead(nn.Module):
-    def __init__(self, in_channels, hidden_size=64, num_classes=3):
+    def __init__(self, in_channels, hidden_size_1=64, hidden_size_2=128, num_classes=3):
         super(ClassifierHead, self).__init__()
         self.classifier = nn.Sequential(
             nn.AdaptiveAvgPool3d(1),  # Global Average Pooling (GAP) instead of flattening. 
-            # for output size [B, 128, 8, 16, 16] => [B, 128, 1, 1, 1] instead of [B, 128*8*16*16=16384]
+            # example: for output size [B, 128, 8, 16, 16] => [B, 128, 1, 1, 1] instead of [B, 128*8*16*16=16384]
             nn.Flatten(),
-            nn.Linear(in_channels, hidden_size),
+            nn.Linear(in_channels, hidden_size_1),
             nn.ReLU(inplace=True),
-            nn.Linear(hidden_size, num_classes)
+            nn.Linear(hidden_size_1, hidden_size_2),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_size_2, num_classes)
         )
 
     def forward(self, x):
@@ -155,29 +159,26 @@ class ClassifierHead(nn.Module):
     
 
 class UNet3D(nn.Module):
-    def __init__(self, depth=3, base_filters=16, clf_threshold=0.5, seg_threshold=0.5):
+    def __init__(self, depth=3, base_filters=16, clf_threshold=[0.5, 0.5, 0.5], seg_threshold=0.5, encoder_dropout=0.0):
         super(UNet3D, self).__init__()
 
         self.name = "UNet3D"
 
         self.depth = depth
         self.base_filters = base_filters
-        self.clf_threshold = clf_threshold
+        self.clf_threshold = torch.tensor(clf_threshold).to(DEVICE)  # for 3 classes
         self.seg_threshold = seg_threshold
 
-        self.encoder = UNetEncoder(depth, base_filters)
+        self.encoder = UNetEncoder(depth, base_filters, dropout=encoder_dropout)
         self.decoder = UNetDecoder(depth, base_filters)
-        self.classifier = ClassifierHead(in_channels=base_filters * (2 ** (depth - 1)), hidden_size=64, num_classes=3)
+        self.classifier = ClassifierHead(in_channels=base_filters * (2 ** (depth - 1)))
 
     def forward(self, x):
 
-        print('Unet Encoding')
         bottleneck, skips = self.encoder(x)
-        print('Unet Classifying')
         classifier_out = self.classifier(bottleneck)
 
         if self.training:
-            print('Unet Decoding (Training Only)')
             segmentation_out = self.decoder(bottleneck, skips)
             return classifier_out, segmentation_out
         else:
@@ -213,7 +214,7 @@ class UNet3D(nn.Module):
         model = cls(
             depth=checkpoint['depth'],
             base_filters=checkpoint['base_filters'],
-            clf_threshold=checkpoint.get('clf_threshold', 0.5),
+            clf_threshold=checkpoint.get('clf_threshold', [0.5, 0.5, 0.5]),
             seg_threshold=checkpoint.get('seg_threshold', 0.5)
         )
         model.load_state_dict(checkpoint['model_state_dict'])

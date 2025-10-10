@@ -47,32 +47,135 @@ clinical_df.columns = clinical_df.columns.str.strip()
 clinical_df = clinical_df.dropna(subset=['ER', 'PR', 'HER2'], how='all')
 clinical_df = clinical_df.set_index('ID').sort_index()
 
-
 masks_to_ignore_df = pd.read_csv(MASKS_PERCENTAGES_CSV)
 masks_to_ignore = set(masks_to_ignore_df[masks_to_ignore_df['percent_outside'] > 60.0]['mask_file'].tolist())
-
-
-# Prepare processed labels
-train_processed_labels = []
-val_processed_labels = []
-test_processed_labels = []
 
 os.makedirs(TRAIN_PROCESSED_DATA, exist_ok=True)
 os.makedirs(VAL_PROCESSED_DATA, exist_ok=True)
 os.makedirs(TEST_PROCESSED_DATA, exist_ok=True)
 
-samples = list(clinical_df.index)
+# Transform text labels into numbers in the dataframe
+def transform_labels(label):
+    if pd.isna(label):
+        return np.nan
+    label = str(label).strip().lower()
+    if label == '+':
+        return 1
+    elif label == '-':
+        return 0
+    else:
+        return -1  # unknown / not standard
 
-complete_samples = clinical_df.dropna(subset=['ER', 'PR', 'HER2']).index.tolist()
-random.shuffle(complete_samples) # seeded with 12345
+for col in ['ER', 'PR', 'HER2']:
+    clinical_df[col] = clinical_df[col].apply(transform_labels)
+
+def balanced_split(clinical_df: pd.DataFrame, val_size=24, test_size=24, max_iter=5000):
+    """
+    Perform iterative balanced splitting of dataset.
+    Returns: train_ids, val_ids, test_ids
+    """
+
+    # Step 1: Identify complete / incomplete samples
+    complete_mask = clinical_df[['ER', 'PR', 'HER2']].notna().all(axis=1)
+    complete_samples = clinical_df[complete_mask]
+    incomplete_samples = clinical_df[~complete_mask]
+
+    # Fix: all incomplete go into train
+    train_ids = set(incomplete_samples.index.tolist())
+
+    # Step 2: Initialize val/test with random complete samples
+    complete_ids = complete_samples.index.tolist()
+    random.shuffle(complete_ids)
+    val_ids = set(complete_ids[:val_size])
+    test_ids = set(complete_ids[val_size:val_size+test_size])
+    train_ids.update(complete_ids[val_size+test_size:])
+
+    # Helper: compute skew metric
+    def compute_skew(train_ids, val_ids, test_ids):
+        ratios = {}
+        for label in ['ER', 'PR', 'HER2']:
+            stats = {}
+            for fold_name, ids in zip(['train', 'val', 'test'], [train_ids, val_ids, test_ids]):
+                subset = clinical_df.loc[list(ids)][label]
+                pos = (subset == 1).sum()
+                neg = (subset == 0).sum()
+                total = pos + neg
+                ratio = pos / total if total > 0 else 0.0
+                stats[fold_name] = ratio
+            mean_ratio = np.mean(list(stats.values()))
+            for fold_name in stats:
+                ratios[(label, fold_name)] = abs(stats[fold_name] - mean_ratio)
+        return max(ratios.values())
+
+    # Step 3: Iterative balancing (swap samples)
+    best_skew = compute_skew(train_ids, val_ids, test_ids)
+
+    for _ in range(max_iter):
+        # Pick two samples from different folds
+        fold_a, fold_b = random.choice(['train', 'val', 'test']), random.choice(['train', 'val', 'test'])
+        if fold_a == fold_b:
+            continue
+
+        ids_a = list(eval(f"{fold_a}_ids"))
+        ids_b = list(eval(f"{fold_b}_ids"))
+        if not ids_a or not ids_b:
+            continue
+
+        sa = random.choice(ids_a)
+        sb = random.choice(ids_b)
+
+        # Apply swap (only for complete samples!)
+        if sa in incomplete_samples.index or sb in incomplete_samples.index:
+            continue
+
+        eval(f"{fold_a}_ids").remove(sa)
+        eval(f"{fold_b}_ids").remove(sb)
+        eval(f"{fold_a}_ids").add(sb)
+        eval(f"{fold_b}_ids").add(sa)
+
+        # Recompute skew
+        new_skew = compute_skew(train_ids, val_ids, test_ids)
+
+        if new_skew <= best_skew:
+            best_skew = new_skew
+        else:
+            # revert swap
+            eval(f"{fold_a}_ids").remove(sb)
+            eval(f"{fold_b}_ids").remove(sa)
+            eval(f"{fold_a}_ids").add(sa)
+            eval(f"{fold_b}_ids").add(sb)
+
+    # Return as lists in original dataframe order
+    train_ids = [idx for idx in clinical_df.index if idx in train_ids]
+    val_ids = [idx for idx in clinical_df.index if idx in val_ids]
+    test_ids = [idx for idx in clinical_df.index if idx in test_ids]
+
+    return train_ids, val_ids, test_ids
+
+# complete_samples = clinical_df.dropna(subset=['ER', 'PR', 'HER2']).index.tolist()
+# random.shuffle(complete_samples) # seeded with 12345
 
 # split samples. test set is 24, val set is 24, rest (193) is train
-# test and val sets each consist of 24 samples that have all 3 markers, no NAs
+# test and val sets each consist of 24 samples that have all 3 labels, no NAs
 # test and val sets will not contain masks. Masks will only be used in training set
 # as an auxiliary supervision task to guide the model towards recognizing the ROIs (tumors)
-test_samples = complete_samples[:24]
-val_samples = complete_samples[24:48]
-train_samples = [s for s in samples if s not in test_samples and s not in val_samples]
+train_ids, val_ids, test_ids = balanced_split(clinical_df, val_size=24, test_size=24, max_iter=5000)
+
+train_samples = clinical_df.loc[train_ids].index.tolist()
+val_samples = clinical_df.loc[val_ids].index.tolist()
+test_samples = clinical_df.loc[test_ids].index.tolist()
+
+
+# Helper function to calculate and print class distribution
+def print_class_distribution(split_name, samples, clinical_df):
+    print(f"Class distribution for {split_name}:")
+    for label in ['ER', 'PR', 'HER2']:
+        subset = clinical_df.loc[samples][label]
+        pos = (subset == 1).sum()
+        neg = (subset == 0).sum()
+        nan = subset.isna().sum()
+        print(f"  {label}: Positive: {pos}, Negative: {neg}, NaN: {nan}")
+
 
 def process_set(samples, PROCESSED_DATA, PROCESSED_CSV, is_train=False):
     os.makedirs(PROCESSED_DATA, exist_ok=True)
@@ -120,8 +223,8 @@ def process_set(samples, PROCESSED_DATA, PROCESSED_CSV, is_train=False):
         # pad and resize image and mask
         img = pad_and_resize(img, TARGET_SHAPE)
         img = img.transpose((2, 1, 0))  # [W, H, D] ->  [D, H, W]
-        img_tensor = torch.from_numpy(img).to(dtype=DTYPE).unsqueeze(0) # float16 for efficiency
-        torch.save(img_tensor, os.path.join(out_dir, "image.pt"))   # [C=1, D, H, W]
+        img_tensor = torch.from_numpy(img).to(dtype=DTYPE).unsqueeze(0)  # float32 for images
+        torch.save(img_tensor, os.path.join(out_dir, "image.pt"))        # [C=1, D, H, W]
 
         if is_train:
             mask = pad_and_resize(mask, TARGET_SHAPE, is_mask=True) # nearest neighbor for masks
@@ -131,17 +234,11 @@ def process_set(samples, PROCESSED_DATA, PROCESSED_CSV, is_train=False):
             torch.save(mask_tensor, os.path.join(out_dir, "mask.pt"))   # [C=1, D, H, W]
         # batch dim is added from the dataloader
 
-        # processing sample labels
-        def to_tensor(str_label):
-            if pd.isna(str_label):
-                return -1
-            if isinstance(str_label, str):
-                return 1 if '+' in str_label.strip().lower() else 0
-            return int(str_label)
+        # processing sample labels (already processed, sanity check)
         label = [
-            to_tensor(row["ER"]),
-            to_tensor(row["PR"]),
-            to_tensor(row["HER2"])
+            row["ER"] if not pd.isna(row["ER"]) else -1,
+            row["PR"] if not pd.isna(row["PR"]) else -1,
+            row["HER2"] if not pd.isna(row["HER2"]) else -1
         ]
         processed_labels.append({"ID": sample_id, "ER": label[0], "PR": label[1], "HER2": label[2]})
 
@@ -150,7 +247,35 @@ def process_set(samples, PROCESSED_DATA, PROCESSED_CSV, is_train=False):
     print(f"Preprocessing complete. Processed data and labels saved in {PROCESSED_CSV}.")
 
 
+# Print class distributions
+print_class_distribution("Train", train_samples, clinical_df)
+print_class_distribution("Validation", val_samples, clinical_df)
+print_class_distribution("Test", test_samples, clinical_df)
+
+# prompt user to confirm before proceeding
+proceed = input("Proceed with data processing? (y/n): ")
+if proceed.lower() != 'y':
+    print("Data processing aborted.")
+    exit(0)
 
 process_set(train_samples, TRAIN_PROCESSED_DATA, TRAIN_PROCESSED_CSV, is_train=True)
 process_set(val_samples, VAL_PROCESSED_DATA, VAL_PROCESSED_CSV, is_train=False)
 process_set(test_samples, TEST_PROCESSED_DATA, TEST_PROCESSED_CSV, is_train=False)
+
+
+# Output of class distributions (after running the script):
+
+# Class distribution for Train:
+#   ER: Positive: 98, Negative: 90, NaN: 5
+#   PR: Positive: 63, Negative: 121, NaN: 9
+#   HER2: Positive: 111, Negative: 70, NaN: 12
+
+# Class distribution for Validation:
+#   ER: Positive: 12, Negative: 12, NaN: 0
+#   PR: Positive: 8, Negative: 16, NaN: 0
+#   HER2: Positive: 15, Negative: 9, NaN: 0
+
+# Class distribution for Test:
+#   ER: Positive: 12, Negative: 12, NaN: 0
+#   PR: Positive: 8, Negative: 16, NaN: 0
+#   HER2: Positive: 15, Negative: 9, NaN: 0

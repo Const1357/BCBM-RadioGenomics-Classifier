@@ -2,6 +2,12 @@ ENV_NAME = BCBM_classifier_env
 
 .PHONY: env install clean lint test data preprocess train eval
 
+setup:
+	make env
+	make install
+	make data
+# 	make preprocess
+
 clean:
 	@echo ">>> Cleaning up"
 	rm -rf $(ENV_NAME)
@@ -21,23 +27,13 @@ install:
 	pip install -r requirements.txt
 	chmod +x scripts/*
 	chmod +x scripts/runners/*
-	@echo ">>> Installing Aspera Connect for data transfer"
-	./scripts/install_aspera_connect.sh
 	source ~/.bashrc
-
-data:
-	@echo ">>> Downloading data"
-	python3 src/utils/download_data.py
 
 preprocess:
 	@echo ">>> Preprocessing data"
 	python3 src/utils/process_data.py
 
-setup:
-	make env
-	make install
-	make data
-	make preprocess
+
 
 train:
 	@echo ">>> Training model (CNN)"

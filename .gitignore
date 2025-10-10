@@ -2,7 +2,8 @@ BCBM_classifier_env
 .vscode
 .__pycache__
 data/
-# data_processed/
+data_processed/*
+experiments/*
 logs/
 models/
 plots/

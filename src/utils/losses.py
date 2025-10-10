@@ -2,74 +2,109 @@ import torch
 import torch.nn.functional as F
 from utils.constants import DEVICE, DTYPE
 
+class BCEwithNanHandling(torch.nn.Module):
+    """
+    BCEWithLogitsLoss that ignores NaN labels and computes per-class mean.\
+    Returns per-class losses instead of a single scalar.
+    """
+
+    def __init__(self, pos_weight: torch.Tensor):
+        super(BCEwithNanHandling, self).__init__()
+        self.pos_weight = pos_weight.to(DEVICE)
+        self.bce_fn = torch.nn.BCEWithLogitsLoss(pos_weight=self.pos_weight, reduction='none')  # [B, C]
+
+    def forward(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """
+        logits: [B, C]
+        labels: [B, C] with possible NaNs
+        returns: per-class BCE loss [C]
+        """
+        valid_mask = labels != -1  # [B, C]
+        labels_clamped = torch.where(valid_mask, labels, torch.zeros_like(labels))  # [B, C]
+
+        bce_raw = self.bce_fn(logits, labels_clamped.to(dtype=DTYPE))  # [B, C]
+        bce_masked = bce_raw * valid_mask.to(dtype=DTYPE)  # zero out NaNs, [B, C]
+
+        # Tensorized per-class mean
+        sum_per_class = bce_masked.sum(dim=0)  # [C]
+        count_per_class = valid_mask.sum(dim=0)  # [C]
+
+        per_class_loss = torch.zeros_like(sum_per_class, device=DEVICE, dtype=DTYPE)
+        mask_nonzero = count_per_class > 0
+        per_class_loss[mask_nonzero] = sum_per_class[mask_nonzero] / count_per_class[mask_nonzero]  # [C]
+
+        return per_class_loss
+    
+
+class AsymmetricFocalLossWithNanHandling(torch.nn.Module):
+    """
+    ASL with per-class gamma and optional positive & negative shifts.
+    Ignores NaN labels (-1) and returns per-class losses.
+    """
+
+    def __init__(self, 
+                 gamma_pos: torch.Tensor,
+                 gamma_neg: torch.Tensor,
+                 shift_m_pos: torch.Tensor,
+                 shift_m_neg: torch.Tensor):
+        super().__init__()
+        self.gamma_pos = gamma_pos
+        self.gamma_neg = gamma_neg
+        self.shift_m_pos = shift_m_pos
+        self.shift_m_neg = shift_m_neg
+
+    def forward(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """
+        logits: [B, C]
+        labels: [B, C] with possible -1
+        returns: per-class loss [C]
+        """
+        valid_mask = labels != -1
+        labels_clamped = torch.where(valid_mask, labels, torch.zeros_like(labels)).to(dtype=DTYPE)
+
+        # Sigmoid probabilities
+        probs = torch.sigmoid(logits)
+
+        # Shifted probabilities
+        # Positive shift: move probs down slightly to reduce easy positive contribution
+        p_pos = (probs - self.shift_m_pos).clamp(min=0.0, max=1.0)
+        # Negative shift: move probs down as before
+        p_neg = (probs - self.shift_m_neg).clamp(min=0.0, max=1.0)
+
+        # Positive loss
+        loss_pos = -labels_clamped * ((1 - p_pos) ** self.gamma_pos) * torch.log(p_pos.clamp(min=1e-8))
+
+        # Negative loss
+        loss_neg = -(1 - labels_clamped) * (p_neg ** self.gamma_neg) * torch.log((1 - p_neg).clamp(min=1e-8))
+
+        # Combine and mask NaNs
+        loss_raw = (loss_pos + loss_neg) * valid_mask.to(dtype=DTYPE)
+
+        # Per-class mean
+        sum_per_class = loss_raw.sum(dim=0)
+        count_per_class = valid_mask.sum(dim=0)
+        per_class_loss = torch.zeros_like(sum_per_class, device=DEVICE, dtype=DTYPE)
+        mask_nonzero = count_per_class > 0
+        per_class_loss[mask_nonzero] = sum_per_class[mask_nonzero] / count_per_class[mask_nonzero]
+
+        return per_class_loss
+
+
 class DiceLoss(torch.nn.Module):
-    def __init__(self, smooth=1e-6):
+    def __init__(self, smooth=1.0):
         super(DiceLoss, self).__init__()
         self.smooth = smooth
 
     def forward(self, predicted, groundtruth):
-        # Apply sigmoid to get probabilities
-        predicted = torch.sigmoid(predicted)
+        """
+        predicted: [B, 1, D, H, W]
+        groundtruth: [B, 1, D, H, W]
+        """
+        predicted = torch.sigmoid(predicted)  # [B,1,D,H,W]
+        predicted = predicted.view(predicted.size(0), -1)  # [B, D*H*W]
+        groundtruth = groundtruth.view(groundtruth.size(0), -1)  # [B, D*H*W]
 
-        # Flatten the tensors
-        predicted = predicted.view(-1)
-        groundtruth = groundtruth.view(-1)
+        intersection = (predicted * groundtruth).sum(dim=1)  # [B]
+        dice_coeff = (2.0 * intersection + self.smooth) / (predicted.sum(dim=1) + groundtruth.sum(dim=1) + self.smooth)  # [B]
 
-        intersection = (predicted * groundtruth).sum()
-        dice_coeff = (2.0 * intersection + self.smooth) / (predicted.sum() + groundtruth.sum() + self.smooth)
-        return 1 - dice_coeff  # Dice loss is 1 - Dice coefficient
-
-class MixedLoss(torch.nn.Module):
-
-    def __init__(self, mix_coeff = 0.5):
-        super(MixedLoss, self).__init__()
-
-        # pre-computed class weights: neg/pos (nan ignored)
-        self.pos_weight = torch.tensor([0.934426, 0.516340, 0.624113], device=DEVICE)
-
-        self.mix_coeff = mix_coeff
-
-        self.bce = torch.nn.BCEWithLogitsLoss(pos_weight=self.pos_weight, reduction='none') # manual reduction for nan filtering
-        self.dice = DiceLoss()
-
-    def forward(self, clf_logits, seg_logits, labels, mask, only_clf=False):
-
-        # clf_logits: [B, 3]
-        # labels: [B, 3] with possible NaNs
-
-        # seg_logits: [B, 1, D, H, W]
-        # mask: [B, 1, D, H, W]
-
-        # Classification loss (BCE) with handling of possible asymmetric NaN labels
-        # num_classes = labels.shape[1]
-
-        clf_loss = 0.0
-        # valid_classes = 0
-
-        valid_mask = ~torch.isnan(labels)     # [B, 3], True where label is valid
-
-        # replacing nans with 0 so BCE can run (temporary, won't be counted in loss)
-        labels_clamped = torch.where(valid_mask, labels, torch.zeros_like(labels))
-
-        bce_raw = self.bce(clf_logits, labels_clamped.to(dtype=DTYPE))  # compute BCE for all, including nans
-
-        bce_masked = bce_raw * valid_mask.to(dtype=DTYPE)  # zero out losses where label is nan
-
-        # Average only over valid entries (across batch and classes)
-        num_valid = valid_mask.sum().item()
-        clf_loss = bce_masked.sum() / num_valid
-
-        if num_valid > 0:
-            clf_loss = clf_loss / num_valid
-        else:
-            clf_loss = torch.tensor(0.0, device=DEVICE, dtype=DTYPE)
-
-        if only_clf:
-            return clf_loss
-        # Segmentation loss
-        
-        seg_loss = self.dice(seg_logits, mask.float())
-
-        # Combined loss
-        total_loss = clf_loss + self.mix_coeff * seg_loss
-        return total_loss, clf_loss, seg_loss
+        return 1 - dice_coeff.mean()  # scalar

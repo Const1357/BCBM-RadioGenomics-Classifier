@@ -25,20 +25,26 @@ class MRIDataset(Dataset):
     def __getitem__(self, idx):
         sample = self.samples[idx]
         sample_dir = os.path.join(self.processed_dir, sample)
-        img_tensor = torch.load(os.path.join(sample_dir, "image.pt")).to(dtype=DTYPE, device=DEVICE)  # convert back to float32 for processing
-
+        img_tensor = torch.load(os.path.join(sample_dir, "image.pt")).to(dtype=torch.float16, device=DEVICE)  # convert back to float32 for processing
+        img_tensor = img_tensor.float()  # ensure float32
         label_row = self.labels_df.loc[sample]
-        label_tensor = torch.tensor([label_row["ER"], label_row["PR"], label_row["HER2"]], dtype=torch.uint8, device=DEVICE)
+        # print(label_row)
+        label_tensor = torch.tensor([label_row["ER"], label_row["PR"], label_row["HER2"]], dtype=torch.int8, device=DEVICE)
 
         if self.is_train:
-            mask_tensor = torch.load(os.path.join(sample_dir, "mask.pt")).to(dtype=torch.uint8, device=DEVICE)
+            mask_tensor = torch.load(os.path.join(sample_dir, "mask.pt")).to(dtype=torch.int8, device=DEVICE)
             if self.augmentations:
                 img_tensor, mask_tensor = self.augmentations(img_tensor, mask_tensor)
-                # z-score normalization after augmentation
-                img_tensor = (img_tensor - img_tensor.mean()) / (img_tensor.std() + 1e-8)
+
+            # z-score normalization after augmentation
+            img_tensor = (img_tensor - img_tensor.mean()) / (img_tensor.std() + 1e-8)
             return img_tensor, mask_tensor, label_tensor
         else:
-            img_tensor = (img_tensor - img_tensor.mean()) / (img_tensor.std() + 1e-8) # z-score normalization
+            if self.augmentations:
+                img_tensor, _ = self.augmentations(img_tensor, torch.zeros_like(img_tensor))  # no mask in validation/test
+
+            # z-score normalization after augmentation
+            img_tensor = (img_tensor - img_tensor.mean()) / (img_tensor.std() + 1e-8)
             return img_tensor, label_tensor
 
 
