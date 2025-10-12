@@ -147,7 +147,7 @@ class ResNet3D(nn.Module):
     - Classifier head receives multi-scale skip features
     - Supports dynamic depth
     """
-    def __init__(self, depth=3, base_filters=16, clf_threshold=[0.5,0.5,0.5], dropout=0.0):
+    def __init__(self, depth=4, base_filters=16, clf_threshold=[0.5,0.5,0.5], dropout=0.0):
         super(ResNet3D, self).__init__()
         self.name = "ResNet3D"
         self.depth = depth

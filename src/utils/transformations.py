@@ -8,35 +8,29 @@ from scipy.ndimage import zoom
 TARGET_SHAPE = (128, 128, 64)   # [W, H, D]. Will be transposed to (D, H, W)
 
 # numpy-based bounding box crop
-def bbox_crop(img, mask=None):
-    """Crop image (and mask, if provided) to the bounding box of the nonzero region of the image."""
+def bbox_crop(img):
+    """Crop image to the bounding box of the nonzero region of the image."""
     coords = np.array(np.nonzero(img))
     if coords.size == 0:
         # No nonzero region, return original(s)
-        if mask is not None:
-            return img, mask
-        else:
-            return img
+        return img
     top_left = coords.min(axis=1)
     bottom_right = coords.max(axis=1) + 1  # slices are exclusive at the top
     slices = tuple(slice(top, bottom) for top, bottom in zip(top_left, bottom_right))
-    if mask is not None:
-        return img[slices], mask[slices]
-    else:
-        return img[slices]
+    img[slices]
     
 
 def resize_volume(volume, target_shape=TARGET_SHAPE, order=1):
     factors = [t / s for t, s in zip(target_shape, volume.shape)]
     return zoom(volume, factors, order=order)
 
-def pad_and_resize(volume, target_shape=TARGET_SHAPE, pad_xy=10, pad_z=5, order=1, is_mask=False) -> np.ndarray:
+def pad_and_resize(volume, target_shape=TARGET_SHAPE, pad_xy=10, pad_z=5, order=1) -> np.ndarray:
 
     faux_target_shape = (target_shape[0] - 2 * pad_xy,
                          target_shape[1] - 2 * pad_xy,
                          target_shape[2] - 2 * pad_z)
     
-    resized = resize_volume(volume, target_shape=faux_target_shape, order=order if not is_mask else 0)
+    resized = resize_volume(volume, target_shape=faux_target_shape, order=order)
 
     # Create final padded volume
     final_volume = np.pad(resized, ((pad_xy, pad_xy), (pad_xy, pad_xy), (pad_z, pad_z)), mode='constant', constant_values=0)
@@ -65,29 +59,13 @@ class Augmentation3D(nn.Module):
         super().__init__()
         self.p = p
 
-    def forward(self, *args):
+    def forward(self, img: torch.Tensor):
         if not self.training or torch.rand(1) > self.p:
-            # No augmentation applied
-            if len(args) == 1:
-                return args[0]
-            elif len(args) == 2:
-                return args
-            else:
-                raise ValueError("Augmentation3D.forward expects 1 or 2 arguments (img, mask)")
-        # Apply augmentations
-        if len(args) == 1:
-            return self.forward_img(args[0])
-        elif len(args) == 2:
-            return self.forward_img_mask(args[0], args[1])
-        else:
-            raise ValueError("Augmentation3D.forward expects 1 or 2 arguments (img, mask)")
+            return img
+        return self.forward_img(img)
 
     def forward_img(self, img):
         raise NotImplementedError
-
-    def forward_img_mask(self, img, mask):
-        # By default, just apply to img and return mask unchanged
-        return self.forward_img(img), mask
 
 class RandomFlip3D(Augmentation3D):
     def __init__(self, p=0.5, dims=('H', 'W')):
@@ -95,22 +73,14 @@ class RandomFlip3D(Augmentation3D):
         self.p = p
         self.dims = dims
 
-    def forward_img_mask(self, img, mask):
-        if not self.training:
-            return img, mask
+    def forward_img(self, img):
+
         do_flip = torch.rand(1) < self.p
         if do_flip:
             if 'W' in self.dims and torch.rand(1) < self.p:
                 img = torch.flip(img, dims=[3])
-                mask = torch.flip(mask, dims=[3])
             if 'H' in self.dims and torch.rand(1) < self.p:
                 img = torch.flip(img, dims=[2])
-                mask = torch.flip(mask, dims=[2])
-        return img, mask
-
-    def forward_img(self, img):
-        mask_dummy = torch.zeros_like(img)
-        img, _ = self.forward_img_mask(img, mask_dummy)
         return img
 
 class RandomTranslation3D(Augmentation3D):
@@ -121,25 +91,18 @@ class RandomTranslation3D(Augmentation3D):
         super().__init__(p)
         self.max_shift = max_shift
 
-    def forward_img_mask(self, img, mask):
+    def forward_img(self, img):
         if not self.training:
-            return img, mask
+            return img
         C, D, H, W = img.shape
         shifts = [torch.randint(-m, m + 1, (1,)).item() for m in self.max_shift]
         pad = (self.max_shift[2],)*2 + (self.max_shift[1],)*2 + (self.max_shift[0],)*2
         img_padded = F.pad(img, pad)
-        mask_padded = F.pad(mask, pad)
         d0 = self.max_shift[0] + shifts[0]
         h0 = self.max_shift[1] + shifts[1]
         w0 = self.max_shift[2] + shifts[2]
         img_out = img_padded[:, d0:d0 + D, h0:h0 + H, w0:w0 + W]
-        mask_out = mask_padded[:, d0:d0 + D, h0:h0 + H, w0:w0 + W]
-        return img_out, mask_out
-
-    def forward_img(self, img):
-        mask_dummy = torch.zeros_like(img)
-        img, _ = self.forward_img_mask(img, mask_dummy)
-        return img
+        return img_out
 
 class ElasticDeformation3D(Augmentation3D):
     def __init__(self, alpha=2.0, sigma=8.0, p=1.0):
@@ -147,9 +110,8 @@ class ElasticDeformation3D(Augmentation3D):
         self.alpha = alpha
         self.sigma = sigma
 
-    def forward_img_mask(self, img, mask):
-        if not self.training:
-            return img, mask
+    def forward_img(self, img):
+
         C, D, H, W = img.shape
         grid = create_identity_grid(img)  # [1, D, H, W, 3]
         disp = torch.randn(D, H, W, 3, device=img.device, dtype=img.dtype)
@@ -170,30 +132,17 @@ class ElasticDeformation3D(Augmentation3D):
         warped_grid = grid + disp.unsqueeze(0) / torch.tensor([W/2, H/2, D/2], device=img.device, dtype=img.dtype)
         # grid_sample expects [N, C, D, H, W] and grid [N, D, H, W, 3]
         img_b = img.unsqueeze(0)
-        mask_b = mask.unsqueeze(0).to(dtype=img.dtype)
         img_out = F.grid_sample(img_b, warped_grid, align_corners=True, mode='bilinear', padding_mode='zeros')
-        mask_out = F.grid_sample(mask_b, warped_grid, align_corners=True, mode='nearest', padding_mode='zeros')
-        # Convert mask back to original dtype if needed
-        if mask.dtype == torch.uint8:
-            mask_out = (mask_out > 0.5).to(torch.uint8)
-        else:
-            mask_out = mask_out.to(mask.dtype)
-        return img_out.squeeze(0), mask_out.squeeze(0)
-
-    def forward_img(self, img):
-        mask_dummy = torch.zeros_like(img)
-        img, _ = self.forward_img_mask(img, mask_dummy)
-        return img
+        return img_out.squeeze(0)
 
 class RandomRotation3D(Augmentation3D):
     def __init__(self, max_angle=10.0, p=1.0):
         super().__init__(p)
         self.max_angle = max_angle
 
-    def forward_img_mask(self, img, mask):
-        if not self.training or torch.rand(1).item() > self.p:
-            return img, mask
-        # img, mask: [C, D, H, W]
+    def forward_img(self, img):
+
+        # img: [C, D, H, W]
         C, D, H, W = img.shape
         # Random rotation angles (in radians)
         angles = (torch.rand(3, device=img.device, dtype=img.dtype) * 2 - 1) * self.max_angle * (torch.pi / 180)
@@ -214,16 +163,10 @@ class RandomRotation3D(Augmentation3D):
 
         # Add batch dimension for affine_grid and grid_sample
         img_b = img.unsqueeze(0)   # [1, C, D, H, W]
-        mask_b = mask.unsqueeze(0).to(dtype=img.dtype) # [1, C, D, H, W]
         grid = F.affine_grid(affine, img_b.size(), align_corners=True)
         img_out = F.grid_sample(img_b, grid, mode='bilinear', padding_mode='zeros', align_corners=True)
-        mask_out = F.grid_sample(mask_b, grid, mode='nearest', padding_mode='zeros', align_corners=True)
-        # Convert mask back to original dtype if needed
-        if mask.dtype == torch.uint8:
-            mask_out = (mask_out > 0.5).to(torch.uint8)
-        else:
-            mask_out = mask_out.to(mask.dtype)
-        return img_out.squeeze(0), mask_out.squeeze(0)
+
+        return img_out.squeeze(0)
 
 class RandomGamma3D(Augmentation3D):
     def __init__(self, gamma_range=(0.8, 1.2), p=1.0):
@@ -280,16 +223,13 @@ class MRIAugmentationPipeline(nn.Module):
         super().__init__()
         self.transforms = nn.ModuleList(transforms)
 
-    def forward(self, img, mask):
+    def forward(self, img):
         for t in self.transforms:
-            out = t(img, mask)
-            if isinstance(out, tuple):
-                img, mask = out
-            else:
-                img = out
-        return img, mask
+            img = t(img)
+        return img
     
+MRI_AUGMENTATION_PIPELINE = MRIAugmentationPipeline()
 
 # Example usage:
 # pipeline = MRIAugmentationPipeline()
-# img_aug, mask_aug = pipeline(img_tensor, mask_tensor)
+# img_aug = pipeline(img_tensor)

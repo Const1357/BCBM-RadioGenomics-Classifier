@@ -6,12 +6,19 @@ import datetime
 import torchmetrics
 from torch.utils.tensorboard import SummaryWriter
 import optuna
+import copy
 # enable tensorboard with: tensorboard --logdir experiments/ResNet3D
 # then open http://localhost:6006 in browser
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from utils.constants import DTYPE, DEVICE, EXPERIMENT_DIR
+from utils.constants import DTYPE, DEVICE, EXPERIMENT_DIR, BATCH_SIZE, GLOBAL_TOP_MODELS, GLOBAL_TOP_MODELS_K
+from utils.data_split import stratified_multilabel_split
+from utils.MRIDataset import MRIDataset
+from utils.transformations import MRI_AUGMENTATION_PIPELINE
+from torch.utils.data import DataLoader
+
+
 
 
 def composite_score(per_class_auc: torch.Tensor,
@@ -65,6 +72,14 @@ def composite_score(per_class_auc: torch.Tensor,
         - weights["std_j"] * std_j
     )
 
+    print(f"AUC mean   : {auc_mean:.4f} * {weights['auc_mean']} = {weights['auc_mean']*auc_mean:.4f}")
+    print(f"AUC min    : {auc_min:.4f} * {weights['auc_min']} = {weights['auc_min']*auc_min:.4f}")
+    print(f"Youden mean: {j_mean:.4f} * {weights['j_mean']} = {weights['j_mean']*j_mean:.4f}")
+    print(f"Youden min : {j_min:.4f} * {weights['j_min']} = {weights['j_min']*j_min:.4f}")
+    print(f"Std AUC    : {std_auc:.4f} * -{weights['std_auc']} = {-weights['std_auc']*std_auc:.4f}")
+    print(f"Std Youden : {std_j:.4f} * -{weights['std_j']} = {-weights['std_j']*std_j:.4f}")
+    print(f"Total score: {score:.4f}\n")
+
     return score
 
 
@@ -73,7 +88,8 @@ class Trainer:
                  model,
                  optimizer,
                  clf_loss,
-                 num_epochs=50,
+                 optimizer_kwargs = {},
+                 num_epochs=40,
                  log_train_every=1,
                  ):
 
@@ -85,19 +101,48 @@ class Trainer:
         self.scaler = torch.amp.GradScaler(device=DEVICE)  # for mixed precision training
 
         self.clf_loss = clf_loss
+
+        self.optimizer_kwargs = optimizer_kwargs
         
+    def optimize_thresholds(self, val_loader):
+        """
+        Compute per-class optimal thresholds using Youden's J on validation set.
+        """
+        self.model.eval()
+        all_probs, all_labels = [], []
+        with torch.no_grad():
+            for img, _, labels in val_loader:
+                img = img.to(DEVICE)
+                labels = labels.to(DEVICE)
+                _, probs = self.model.predict(img)
+                all_probs.append(probs.cpu())
+                all_labels.append(labels.cpu())
+
+        all_probs = torch.cat(all_probs)
+        all_labels = torch.cat(all_labels)
+
+        thresholds = torch.zeros(3)
+        for c in range(3):
+            mask = all_labels[:, c] != -1
+            probs_c = all_probs[mask, c]
+            labels_c = all_labels[mask, c].int()
+
+            fpr, tpr, t = torchmetrics.functional.roc(probs_c, labels_c, task='binary')
+            j = tpr - fpr
+            best_idx = torch.argmax(j)
+            thresholds[c] = t[best_idx]
+        return thresholds
 
     def train_one_epoch(self, train_loader, epoch):
         self.model.train()
         epoch_clf_loss = torch.zeros(3, device=DEVICE, dtype=DTYPE)  # Per-class loss
         total_batches = 0
 
-        for i, (img, mask, labels) in enumerate(train_loader):
+        for i, (img, labels) in enumerate(train_loader):
 
             print(f'[{datetime.datetime.now().time().strftime("%H:%M:%S")}] Batch {i+1}/{len(train_loader)} loaded')
 
             img = img.to(DEVICE, DTYPE)
-            mask = mask.to(DEVICE)
             labels = labels.to(DEVICE)
 
             self.optimizer.zero_grad()
@@ -135,6 +180,7 @@ class Trainer:
             self.writer.add_scalar(f'Loss/train_clf_{class_name}', epoch_clf_loss[class_idx].item(), epoch)
 
         return epoch_clf_loss
+
 
     def train(self, train_loader, val_loader, test_loader=None, trial: optuna.trial.Trial=None):
 
@@ -210,7 +256,132 @@ class Trainer:
         
         return self.best_val_auc_objective
 
-    def evaluate(self, eval_loader, epoch, mode='val'):
+    
+
+    def train_cv(self, train_dataframe, trial: optuna.trial.Trial = None):
+        import json, heapq
+        print('train')
+
+        # --- Experiment directory setup ---
+        if trial is None:
+            self._experiment_dir = os.path.join(
+                EXPERIMENT_DIR, self.model.name,
+                datetime.datetime.now().strftime("experiment_%Y%m%d_%H%M%S")
+            )
+            trial_number = "manual"
+        else:
+            self._experiment_dir = os.path.join(EXPERIMENT_DIR, self.model.name, f"trial_{trial.number}")
+            trial_number = trial.number
+
+        os.makedirs(self._experiment_dir, exist_ok=True)
+        self.writer = SummaryWriter(log_dir=self._experiment_dir)
+        self.writer.add_text("config", str(self.model.get_config()), 0)
+        self.writer.add_text("optimizer", str(self.optimizer), 0)
+
+        # --- Save Optuna trial parameters if applicable ---
+        if trial is not None:
+            params_path = os.path.join(self._experiment_dir, "trial_params.json")
+            with open(params_path, "w") as f:
+                json.dump(trial.params, f, indent=4)
+
+        # --- Cross-validation folds ---
+        folds = stratified_multilabel_split(train_dataframe)
+        num_folds = len(folds)
+
+        # --- Create models and optimizers in memory (no swapping) ---
+        fold_models = [copy.deepcopy(self.model).to(DEVICE) for _ in range(num_folds)]
+        fold_opts = [
+            self.optimizer(m.parameters(), **self.optimizer_kwargs)
+            for m in fold_models
+        ]
+
+        # --- Track best per-fold and global top-5 ---
+        best_fold_scores = [-float('inf')] * num_folds
+
+        # --- Prebuild all dataloaders (no leakage) ---
+        fold_loaders = []
+        for train_df, val_df in folds:
+            train_ds = MRIDataset(train_df, augmentations=MRI_AUGMENTATION_PIPELINE)
+            val_ds = MRIDataset(val_df)
+            train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
+            val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
+            fold_loaders.append((train_loader, val_loader))
+
+        # --- Main training loop ---
+        for epoch in range(self.num_epochs):
+            fold_scores = np.zeros(num_folds)
+
+            for fold_idx in range(num_folds):
+                print(f"Epoch {epoch+1} - fold {fold_idx+1}")
+                model = fold_models[fold_idx]
+                optimizer = fold_opts[fold_idx]
+                train_loader, val_loader = fold_loaders[fold_idx]
+
+                self.model = model
+                self.optimizer = optimizer
+
+                # --- Train one epoch ---
+                train_clf_loss = self.train_one_epoch(train_loader, epoch)
+
+                # --- Validate this fold ---
+                val_metrics = self.evaluate(val_loader, epoch, mode='val', log_name=f'fold_{fold_idx}')
+                aucs = torch.tensor([m['auc'] for m in val_metrics.values()])
+                youden_js = torch.tensor([m['youden_j'] for m in val_metrics.values()])
+                fold_score = composite_score(aucs, youden_js)
+                fold_scores[fold_idx] = fold_score.item()
+
+                # --- Track best model per fold ---
+                if fold_score > best_fold_scores[fold_idx]:
+                    best_fold_scores[fold_idx] = fold_score
+
+                    # Add to global top-5 heap
+                    model_path = os.path.join(
+                        self._experiment_dir,
+                        f"model_trial{trial_number}_fold{fold_idx}_score{fold_score:.4f}.pt"
+                    )
+                    torch.save(model.state_dict(), model_path)
+
+                    model_params = {
+                        "depth": model.depth,
+                        "base_filters": model.base_filters,
+                        "clf_threshold": [float(x) for x in model.clf_threshold.cpu().numpy()],
+                        "dropout": model.dropout,
+                    }
+
+                    heapq.heappush(GLOBAL_TOP_MODELS, (fold_score.item(), model_path, model_params, val_metrics))
+                    if len(GLOBAL_TOP_MODELS) > GLOBAL_TOP_MODELS_K:
+                        # remove lowest scoring model
+                        _, worst_path, _, _ = heapq.heappop(GLOBAL_TOP_MODELS)
+                        if os.path.exists(worst_path):
+                            os.remove(worst_path)
+
+                print(f"[Epoch {epoch+1}] Fold {fold_idx+1}/{num_folds} composite score: {fold_score:.4f}")
+
+            # --- Aggregate per-epoch results ---
+            mean_fold_score = float(fold_scores.mean())
+            self.writer.add_scalar('val/mean_composite', mean_fold_score, epoch)
+            print(f"Epoch {epoch+1}/{self.num_epochs} | Mean fold composite: {mean_fold_score:.4f}")
+
+            # --- Optuna pruning ---
+            if trial is not None:
+                trial.report(mean_fold_score, step=epoch)
+                if trial.should_prune():
+                    print(f"Trial pruned at epoch {epoch+1}")
+                    raise optuna.exceptions.TrialPruned()
+
+        # --- After training ---
+        mean_best_score = np.mean(best_fold_scores)
+        print(f"Training complete. Mean best fold composite: {mean_best_score:.4f}")
+
+        return mean_best_score
+
+
+
+
+    def evaluate(self, eval_loader, epoch, mode='val', log_name=''):
+
+        if log_name != '':
+            log_name = log_name + '/'
 
         self.model.eval()
         all_preds = []
@@ -247,7 +418,7 @@ class Trainer:
                 clf_loss /= len(eval_loader)
                 class_names = ['ER', 'PR', 'HER2']
                 for class_idx, class_name in enumerate(class_names):
-                    self.writer.add_scalar(f'Loss/val_clf_{class_name}', clf_loss[class_idx].item(), epoch)
+                    self.writer.add_scalar(f'Loss/{log_name}val_clf_{class_name}', clf_loss[class_idx].item(), epoch)
 
         # N = len(eval_loader)
         all_preds = torch.cat(all_preds)    # [N, 3]
@@ -280,13 +451,13 @@ class Trainer:
             conf_matrix = torchmetrics.functional.confusion_matrix(preds_class, labels_class, task='binary')
 
 
-            self.writer.add_scalar(f'{mode}/{class_name}_accuracy', acc.item(), epoch)
-            self.writer.add_scalar(f'{mode}/{class_name}_precision', prec.item(), epoch)
-            self.writer.add_scalar(f'{mode}/{class_name}_recall', rec.item(), epoch)
-            self.writer.add_scalar(f'{mode}/{class_name}_f1', f1.item(), epoch)
-            self.writer.add_scalar(f'{mode}/{class_name}_auc', auc.item(), epoch)
-            self.writer.add_scalar(f'{mode}/{class_name}_youden_j', youden_j)
-            self.writer.add_text(f'{mode}/{class_name}_confusion_matrix', str(conf_matrix.cpu().numpy()), epoch)
+            self.writer.add_scalar(f'{mode}/{log_name}{class_name}_accuracy', acc.item(), epoch)
+            self.writer.add_scalar(f'{mode}/{log_name}{class_name}_precision', prec.item(), epoch)
+            self.writer.add_scalar(f'{mode}/{log_name}{class_name}_recall', rec.item(), epoch)
+            self.writer.add_scalar(f'{mode}/{log_name}{class_name}_f1', f1.item(), epoch)
+            self.writer.add_scalar(f'{mode}/{log_name}{class_name}_auc', auc.item(), epoch)
+            self.writer.add_scalar(f'{mode}/{log_name}{class_name}_youden_j', youden_j)
+            self.writer.add_text(f'{mode}/{log_name}{class_name}_confusion_matrix', str(conf_matrix.cpu().numpy()), epoch)
 
             accs.append(acc.item())
             precs.append(prec.item())
@@ -296,12 +467,12 @@ class Trainer:
             youden_js.append(youden_j.item())
 
         # Log averaged metrics
-        self.writer.add_scalar(f'{mode}/accuracy_all', np.mean(accs), epoch)
-        self.writer.add_scalar(f'{mode}/precision_all', np.mean(precs), epoch)
-        self.writer.add_scalar(f'{mode}/recall_all', np.mean(recs), epoch)
-        self.writer.add_scalar(f'{mode}/f1_all', np.mean(f1s), epoch)
-        self.writer.add_scalar(f'{mode}/auc_all', np.mean(aucs), epoch)
-        self.writer.add_scalar(f'{mode}/youden_j_all', np.mean(youden_js), epoch)
+        self.writer.add_scalar(f'{mode}/{log_name}accuracy_all', np.mean(accs), epoch)
+        self.writer.add_scalar(f'{mode}/{log_name}precision_all', np.mean(precs), epoch)
+        self.writer.add_scalar(f'{mode}/{log_name}recall_all', np.mean(recs), epoch)
+        self.writer.add_scalar(f'{mode}/{log_name}f1_all', np.mean(f1s), epoch)
+        self.writer.add_scalar(f'{mode}/{log_name}auc_all', np.mean(aucs), epoch)
+        self.writer.add_scalar(f'{mode}/{log_name}youden_j_all', np.mean(youden_js), epoch)
 
         # Return per-class metrics
         metrics = {}
