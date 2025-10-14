@@ -2,6 +2,7 @@ import os
 import optuna
 import torch
 import numpy as np
+import pandas as pd
 from torch.utils.data import DataLoader
 
 from utils.constants import *
@@ -12,6 +13,10 @@ from utils.transformations import MRI_AUGMENTATION_PIPELINE
 from Trainer import Trainer
 from utils.losses import AsymmetricFocalLossWithNanHandling#, DiceLoss
 from utils.data_split import extract_test_set, split_complete_partial, stratified_multilabel_split
+
+from utils.Evaluator import Evaluator
+
+import re
 
 import json
 
@@ -89,7 +94,7 @@ def objective(trial: optuna.trial.Trial) -> float:
 
 def main():
 
-    study = optuna.create_study(direction="maximize", pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=5))
+    study = optuna.create_study(direction="maximize", pruner=optuna.pruners.MedianPruner(n_startup_trials=3, n_warmup_steps=5))
     study.optimize(objective, n_trials=N_TRIALS, timeout=None)
 
     # best fold models (from any trial, from any fold)
@@ -97,15 +102,88 @@ def main():
     with open(f"{EXPERIMENT_DIR}/ResNet3D/global_top_models.json", "w") as f:
         json.dump(data, f, indent=2)
 
+    exit()
+    
+    # from pathlib import Path
+    # # populate GLOBAL_TOP_MODELS with all .pt files under 
+    # experiment_path = os.path.join(EXPERIMENT_DIR, 'ResNet3D')
+    # best_model_paths = [str(p) for p in Path(experiment_path).rglob("*.pt")]
 
-    # load the best models
-    best_models = []
-    for score, path, params, metrics in GLOBAL_TOP_MODELS:
-        model = ResNet3D(**params).to(DEVICE)
-        state_dict = torch.load(path, map_location=DEVICE)
-        model.load_state_dict(state_dict=state_dict)
-        model.eval()
-        best_models.append(model)
+    # # load the best models
+    # best_models = []
+    # best_model_names = []
+    # for path in best_model_paths:
+    #     model = ResNet3D(depth=5, base_filters=16, clf_threshold=[0.5, 0.5, 0.5], dropout=0).to(DEVICE)
+    #     state_dict = torch.load(path, map_location=DEVICE)
+    #     model.load_state_dict(state_dict=state_dict)
+    #     model.eval()
+    #     best_models.append(model)
+    #     best_model_names.append(re.sub(r".*/", "", path)[:-3])
+
+    # print(best_model_names)
+
+    evaluator = Evaluator(best_models, best_model_names)
+
+    # TRAIN_DATASET = MRIDataset(TRAIN_DF, augmentations=None)
+    # test_loader = DataLoader(TRAIN_DATASET, batch_size=2, shuffle=False)
+    # all_model_metrics = evaluator.evaluate(test_loader)
+
+    # for model_name, class_metrics in all_model_metrics.items():
+    #     rows = []
+    #     for class_name, metrics in class_metrics.items():
+    #         row = {
+    #             "Class": class_name,
+    #             "Accuracy": metrics["accuracy"],
+    #             "Precision": metrics["precision"],
+    #             "Recall": metrics["recall"],
+    #             "F1": metrics["f1"],
+    #             "AUC": metrics["auc"],
+    #             "Threshold": metrics["threshold"],
+    #             "Youden_J": metrics["youden_j"],
+    #             "Confusion_Matrix": metrics["conf_matrix"],
+    #         }
+    #         rows.append(row)
+
+    #     df = pd.DataFrame(rows).set_index("Class")
+    #     print(model_name)
+    #     print(df)
+    #     print('\n')
+        
+    # thresholds = [
+    #     [0.568359, 0.521484, 0.658691],
+    #     [0.502441, 0.515137, 0.725098],
+    #     [0.509766, 0.480469, 0.671387],
+    #     [0.476807, 0.481445, 0.540527],
+    #     [0.527832, 0.532227, 0.657227],
+    # ]
+
+    # for i,model in enumerate(evaluator.models):
+    #     model.clf_threshold = torch.tensor(thresholds[i], device=DEVICE)
+
+    # TEST_DATASET = MRIDataset(TEST_DF, augmentations=None)
+    # test_loader = DataLoader(TEST_DATASET, batch_size=2, shuffle=False)
+    # all_model_metrics = evaluator.evaluate(test_loader)
+
+    # for model_name, class_metrics in all_model_metrics.items():
+    #     rows = []
+    #     for class_name, metrics in class_metrics.items():
+    #         row = {
+    #             "Class": class_name,
+    #             "Accuracy": metrics["accuracy"],
+    #             "Precision": metrics["precision"],
+    #             "Recall": metrics["recall"],
+    #             "F1": metrics["f1"],
+    #             "AUC": metrics["auc"],
+    #             "Threshold": metrics["threshold"],
+    #             "Youden_J": metrics["youden_j"],
+    #             "Confusion_Matrix": metrics["conf_matrix"],
+    #         }
+    #         rows.append(row)
+
+    #     df = pd.DataFrame(rows).set_index("Class")
+    #     print(model_name)
+    #     print(df)
+    #     print('\n')
 
     # retraining the best models on the entire dataset for a few epochs, with a small learning rate (re-fit with OOF data)
     # TRAIN_DATASET = MRIDataset(TRAIN_DF, augmentations=MRI_AUGMENTATION_PIPELINE)

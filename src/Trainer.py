@@ -38,8 +38,8 @@ def composite_score(per_class_auc: torch.Tensor,
 
     if weights is None:
         weights = dict(
-            auc_mean=0.40,
-            auc_min=0.20,
+            auc_mean=0.35,
+            auc_min=0.35,
             j_mean=0.20,
             j_min=0.10,
             std_auc=0.05,
@@ -456,7 +456,7 @@ class Trainer:
             self.writer.add_scalar(f'{mode}/{log_name}{class_name}_recall', rec.item(), epoch)
             self.writer.add_scalar(f'{mode}/{log_name}{class_name}_f1', f1.item(), epoch)
             self.writer.add_scalar(f'{mode}/{log_name}{class_name}_auc', auc.item(), epoch)
-            self.writer.add_scalar(f'{mode}/{log_name}{class_name}_youden_j', youden_j)
+            self.writer.add_scalar(f'{mode}/{log_name}{class_name}_youden_j', youden_j, epoch)
             self.writer.add_text(f'{mode}/{log_name}{class_name}_confusion_matrix', str(conf_matrix.cpu().numpy()), epoch)
 
             accs.append(acc.item())

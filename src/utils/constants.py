@@ -17,12 +17,12 @@ TEST_LABEL_FILE = 'data_processed/test_data/clinical_labels.csv'
 # EXPERIMENT_DIR = 'experiments/UNet3D'
 EXPERIMENT_DIR = 'experiments'
 
-BATCH_SIZE = 2
+BATCH_SIZE = 4
 
-GLOBAL_TOP_MODELS_K = 5
+GLOBAL_TOP_MODELS_K = 10    # 10 candidate models
 GLOBAL_TOP_MODELS = []
 
 NUM_EPOCHS = 40
-N_TRIALS = 30
+N_TRIALS = 50
 
 print(DEVICE, DTYPE)
