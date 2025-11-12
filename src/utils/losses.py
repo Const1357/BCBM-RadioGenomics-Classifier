@@ -90,6 +90,7 @@ class AsymmetricFocalLossWithNanHandling(torch.nn.Module):
         return per_class_loss
 
 
+# Was used for auxiliary segmentation task using Unet; kept for possible future use
 class DiceLoss(torch.nn.Module):
     def __init__(self, smooth=1.0):
         super(DiceLoss, self).__init__()

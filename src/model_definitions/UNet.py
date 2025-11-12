@@ -5,17 +5,10 @@ import os
 
 from utils.constants import DEVICE
 
-# Why U-Net?
-# U-Net is popular for segmentation tasks due to its encoder-decoder structure with skip connections.
-# The encoder produces hierarchical features, while the decoder reconstructs the segmentation map.
-# Skip connections help retain spatial information lost during downsampling.
 
-# The shared encoder extracts features useful for both segmentation and classification.
-# Our main task is binary classification of 3 classes, but we perform segmentation as a secondary task.
-# The segmentation task helps the model learn better spatial features, improving classification performance.
-
-# U-Net is also able to learn from limited (and augmented) data, which is beneficial in medical imaging contexts.
-# GAP (Global Average Pooling) is used in the classifier head to reduce overfitting and model size.
+# UNet was used in an earlier experiment of this project, but later replaced by ResNet3D
+# when we discarded masks (=> segmentation as an auxiliary learning task).
+# It is kept here for possible future reference.
 
 class ConvBlock3D(nn.Module):
 
@@ -227,9 +220,3 @@ class UNet3D(nn.Module):
             'clf_threshold': self.clf_threshold,
             'seg_threshold': self.seg_threshold,
         }
-
-# TODO:
-# - Load a test sample and pass it through the model to verify dimensions
-# - Implement training loop with combined loss (DiceLoss + BCE for segmentation, CrossEntropy for classification)
-# - Add evaluation metrics (e.g., IoU for segmentation, accuracy/precision/recall/f1 for classification)
-# - Experiment with hyperparameters (depth, base_filters, learning rate, etc.)

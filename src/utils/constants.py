@@ -23,6 +23,6 @@ GLOBAL_TOP_MODELS_K = 10    # 10 candidate models
 GLOBAL_TOP_MODELS = []
 
 NUM_EPOCHS = 40
-N_TRIALS = 50
+N_TRIALS = 40
 
 print(DEVICE, DTYPE)

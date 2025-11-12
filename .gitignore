@@ -3,7 +3,9 @@ BCBM_classifier_env
 .__pycache__
 data/
 data_processed/*
+data_processed
 experiments/*
+experiments
 logs/
 models/
 plots/
@@ -11,3 +13,6 @@ plots/
 .DS_Store
 *__pycache__*
 notebooks/*
+notebooks
+backup/*
+backup

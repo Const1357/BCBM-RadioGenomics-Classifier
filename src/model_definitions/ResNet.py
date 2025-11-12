@@ -3,9 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from utils.constants import DEVICE
 
-# -----------------------------
 # Basic 3D Residual Block
-# -----------------------------
 class ResBlock3D(nn.Module):
     """
     A simple 3D residual block: Conv3D -> BN -> ReLU -> Conv3D -> BN + residual
@@ -40,9 +38,7 @@ class ResBlock3D(nn.Module):
         out = self.relu(out)
         return out
 
-# -----------------------------
 # ResNet3D Encoder
-# -----------------------------
 class ResNet3DEncoder(nn.Module):
     """
     3D ResNet Encoder with residual blocks.
@@ -81,9 +77,7 @@ class ResNet3DEncoder(nn.Module):
                 x = self.downsamples[i](x)
         return x, skips  # x is bottleneck
 
-# ────────────────────────────────
 #   Classifier Head with Skip Weights
-# ────────────────────────────────
 class ClassifierHead3D(nn.Module):
     """
     Combines multi-scale skip features via learnable per-skip weights,
@@ -137,9 +131,7 @@ class ClassifierHead3D(nn.Module):
         out = self.classifier(concat)
         return out
 
-# -----------------------------
 # Full ResNet3D Classifier
-# -----------------------------
 class ResNet3D(nn.Module):
     """
     ResNet for 3D Image MultiLabel Classification.
@@ -170,15 +162,46 @@ class ResNet3D(nn.Module):
         classifier_out = self.classifier(skips)
         return classifier_out
 
-    def predict(self, x, return_raw=False):
+    def predict(self, x, return_raw=False, saliency=False):
         self.eval()
+
+        if not saliency:
+            with torch.no_grad():
+                classifier_out = self.forward(x)
+                probs = torch.sigmoid(classifier_out)
+                preds = (probs > self.clf_threshold).float()
+            if return_raw:
+                return preds, probs, classifier_out
+            return preds, probs
+
+        # Vanilla Saliency maps
+        num_labels = self.classifier.classifier[-1].out_features
+        saliency_maps = {}
+
+        # ensure input requires grad
+        x_req = x.clone().detach().requires_grad_(True)
+
+        # forward pass
+        classifier_out = self.forward(x_req)
+
+        for label_idx in range(num_labels):
+            self.zero_grad()
+            score = classifier_out[0, label_idx]  # assuming batch size 1
+            score.backward(retain_graph=True)
+            grad = x_req.grad.detach().cpu()[0, 0]  # [D, H, W], assuming 1 input channel
+            saliency_maps[label_idx] = grad.abs().numpy()  # take absolute value
+
+            # reset gradients for next label
+            x_req.grad.zero_()
+
+        # standard prediction
         with torch.no_grad():
-            classifier_out = self.forward(x)
             probs = torch.sigmoid(classifier_out)
             preds = (probs > self.clf_threshold).float()
+
         if return_raw:
-            return preds, probs, classifier_out
-        return preds, probs
+            return preds, probs, classifier_out, saliency_maps
+        return preds, probs, saliency_maps
 
     def store(self, filepath):
         state = {

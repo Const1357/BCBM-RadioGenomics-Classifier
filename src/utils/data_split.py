@@ -2,8 +2,9 @@ import numpy as np
 import pandas as pd
 from sklearn.model_selection import StratifiedKFold
 
-def extract_test_set():
-    df = pd.read_csv('data_processed/clinical_labels.csv')
+def extract_test_set(specify_path=None):
+    path = specify_path if specify_path is not None else 'data_processed/clinical_labels.csv'
+    df = pd.read_csv(path)
 
     complete_mask = (df[['ER', 'PR', 'HER2']] != -1).all(axis=1)
     complete_df = df[complete_mask].copy()
@@ -24,12 +25,7 @@ def extract_test_set():
     return test_df, remaining_df
 
 def split_complete_partial(df: pd.DataFrame):
-    """
-    Split the dataset into complete and partial samples.
 
-    A complete sample has all three labels != -1.
-    A partial sample has at least one label == -1.
-    """
     complete_mask = (df[['ER', 'PR', 'HER2']] != -1).all(axis=1)
     complete_df = df[complete_mask].copy()
     partial_df = df[~complete_mask].copy()
@@ -40,20 +36,7 @@ def split_complete_partial(df: pd.DataFrame):
 
 
 def stratified_multilabel_split(df: pd.DataFrame, n_splits=5, seed=12345):
-    """
-    Perform stratified K-fold splits for multilabel data using only complete samples for validation.
 
-    Args:
-        df (pd.DataFrame): Must contain columns ['ID', 'ER', 'PR', 'HER2'].
-                           Missing labels are encoded as -1.
-        n_splits (int): Number of folds.
-        seed (int): Random seed.
-
-    Returns:
-        folds: list of (train_df, val_df) pairs.
-               Each train_df includes: complete_train + all partial samples.
-               Each val_df includes: complete_val only.
-    """
     # --- Split into complete and partial ---
     complete_mask = (df[['ER', 'PR', 'HER2']] != -1).all(axis=1)
     complete_df = df[complete_mask].copy()

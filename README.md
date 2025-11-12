@@ -20,3 +20,6 @@ change ssh configs to match new ip
 
 enable tensorboard with: tensorboard --logdir models/
 then open http://localhost:6006 in browser
+
+
+2 4 7 models for ensemble
